@@ -4,26 +4,21 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Audio a Tablatura</title>
+<script src="https://cdn.jsdelivr.net/npm/@coderline/alphatab@1.5.0/dist/alphaTab.js"></script>
 <style>
 :root{--bg:#14161a;--card:#1e2128;--tx:#e8e8ea;--ac:#f5a524;--mu:#8b8f99}
 *{box-sizing:border-box}
-body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--tx);padding:16px;max-width:1000px;margin:auto}
+body{margin:0 auto;font-family:system-ui,sans-serif;background:var(--bg);color:var(--tx);padding:16px;max-width:1100px}
 h1{font-size:1.4rem;margin:.2em 0}
 .card{background:var(--card);border-radius:12px;padding:14px;margin:12px 0}
 button{background:var(--ac);color:#000;border:0;border-radius:8px;padding:10px 16px;font-weight:700;cursor:pointer;margin:4px 4px 4px 0}
 button:disabled{opacity:.4;cursor:default}
 label{display:block;margin:8px 0;color:var(--mu);font-size:.9rem}
 input[type=range]{width:220px;vertical-align:middle}
+input[type=number],select{background:#2a2e37;color:var(--tx);border:1px solid #444;border-radius:6px;padding:6px;width:110px}
 #estado{color:var(--mu);margin-top:8px}
 progress{width:100%;height:10px}
-#tab{display:flex;flex-wrap:wrap;gap:14px 0;font-family:monospace}
-.col{display:flex;flex-direction:column;align-items:center;padding:0 4px;border-radius:4px}
-.col span{height:20px;line-height:20px;min-width:22px;text-align:center;background:linear-gradient(transparent 9px,#555 9px,#555 10px,transparent 10px)}
-.col.on{background:var(--ac)}
-.col.on span{color:#000;font-weight:700}
-.bloque{display:flex;flex-wrap:nowrap;margin-right:10px;padding-right:6px;border-right:2px solid #555}
-.cuerdas{display:flex;flex-direction:column;color:var(--mu);font-family:monospace;padding-right:6px}
-.cuerdas span{height:20px;line-height:20px}
+#partitura{background:#fff;color:#000;border-radius:12px;padding:10px;min-height:120px}
 small{color:var(--mu)}
 </style>
 </head>
@@ -43,23 +38,37 @@ small{color:var(--mu)}
 </div>
 
 <div class="card">
-  <button id="btnPlay" disabled>▶ Reproducir</button>
+  <label>Tempo (BPM) — vacío = automático
+    <input type="number" id="bpm" min="40" max="220" placeholder="auto"></label>
+  <label>Compás
+    <select id="comp">
+      <option value="4,4,16">4/4</option>
+      <option value="3,4,12">3/4</option>
+      <option value="2,4,8">2/4</option>
+      <option value="6,8,12">6/8</option>
+    </select></label>
+  <small>Si la partitura sale “corrida” o con ritmos raros, prueba a escribir el tempo a mano (o la mitad / el doble del que detectó).</small>
+</div>
+
+<div class="card">
+  <button id="btnPlay" disabled>▶ Reproducir / Pausa</button>
   <button id="btnStop" disabled>■ Detener</button>
   <button id="btnMidi" disabled>⬇ Descargar .mid</button>
 </div>
 
-<div class="card"><div id="tab"></div></div>
+<div id="partitura"></div>
 
 <script type="module">
 import { BasicPitch, noteFramesToTime, addPitchBendsToNoteEvents, outputToNotesPoly }
   from "https://esm.sh/@spotify/basic-pitch@1.0.1";
 
 const MODEL = "https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/model/model.json";
-const AFINACION = [40,45,50,55,59,64]; // E2 A2 D3 G3 B3 E4 (cuerda 0 = la más grave)
-const NOMBRES = ["E","B","G","D","A","E"]; // de arriba a abajo en pantalla
+const AT = "https://cdn.jsdelivr.net/npm/@coderline/alphatab@1.5.0/dist/";
+const AFINACION = [40,45,50,55,59,64]; // E2 A2 D3 G3 B3 E4 (índice 0 = cuerda más grave)
 const $ = id => document.getElementById(id);
-let audioBuf = null, eventos = [], notasFinal = [], actx = null, timers = [];
+let audioBuf = null, eventos = [], notasFinal = [], api = null, playerListo = false;
 
+// ---------- Audio ----------
 $("archivo").onchange = async e => {
   const f = e.target.files[0]; if (!f) return;
   $("estado").textContent = "Leyendo audio...";
@@ -67,7 +76,6 @@ $("archivo").onchange = async e => {
     const ac = new (window.AudioContext || window.webkitAudioContext)();
     const dec = await ac.decodeAudioData(await f.arrayBuffer());
     ac.close();
-    // pasar a mono 22050 Hz, que es lo que pide el modelo
     const n = Math.ceil(dec.duration * 22050);
     const off = new OfflineAudioContext(1, n, 22050);
     const src = off.createBufferSource(); src.buffer = dec; src.connect(off.destination); src.start();
@@ -86,29 +94,28 @@ $("btnTrans").onclick = async () => {
     await bp.evaluateModel(audioBuf.getChannelData(0),
       (f,o,c) => { frames.push(...f); onsets.push(...o); contours.push(...c); },
       p => { $("prog").value = p; });
-    const umbral = 1 - $("sens").value / 100; // sensibilidad -> umbral
+    const umbral = 1 - $("sens").value / 100;
     const crudas = noteFramesToTime(addPitchBendsToNoteEvents(contours,
       outputToNotesPoly(frames, onsets, umbral, umbral, 5)));
     const minDur = $("minlen").value / 1000;
     notasFinal = crudas.filter(n => n.pitchMidi >= 40 && n.pitchMidi <= 88 && n.durationSeconds >= minDur)
       .sort((a,b) => a.startTimeSeconds - b.startTimeSeconds);
-    armarTablatura();
-    $("estado").textContent = notasFinal.length + " notas detectadas.";
-    ["btnPlay","btnStop","btnMidi"].forEach(i => $(i).disabled = !eventos.length);
+    asignarCuerdas();
+    $("btnMidi").disabled = !eventos.length;
+    armarPartitura();
   } catch (err) { $("estado").textContent = "Error: " + err.message; }
   $("prog").hidden = true; $("btnTrans").disabled = false;
 };
 
-// ---- Asignar cuerda y traste ----
-function armarTablatura() {
+// ---------- Cuerda y traste ----------
+function asignarCuerdas() {
   const grupos = [];
   for (const n of notasFinal) {
     const g = grupos[grupos.length-1];
     if (g && n.startTimeSeconds - g.t < 0.06) g.notas.push(n);
     else grupos.push({ t: n.startTimeSeconds, notas: [n] });
   }
-  let pos = 5; // posición de la mano
-  eventos = [];
+  let pos = 5; eventos = [];
   for (const g of grupos) {
     const usadas = new Set(), res = [];
     for (const n of g.notas.sort((a,b) => b.pitchMidi - a.pitchMidi).slice(0,6)) {
@@ -122,67 +129,98 @@ function armarTablatura() {
       if (mejor) { usadas.add(mejor.s); res.push({ s: mejor.s, fr: mejor.fr, midi: n.pitchMidi, dur: n.durationSeconds }); }
     }
     if (res.length) {
-      const trastes = res.filter(r => r.fr > 0).map(r => r.fr);
-      if (trastes.length) pos = Math.round(trastes.reduce((a,b)=>a+b,0) / trastes.length);
+      const tr = res.filter(r => r.fr > 0).map(r => r.fr);
+      if (tr.length) pos = Math.round(tr.reduce((a,b)=>a+b,0) / tr.length);
       eventos.push({ t: g.t, notas: res });
     }
   }
-  dibujar();
 }
 
-function dibujar() {
-  const cont = $("tab"); cont.innerHTML = "";
-  for (let i = 0; i < eventos.length; i += 14) {
-    const bl = document.createElement("div"); bl.className = "bloque";
-    const cu = document.createElement("div"); cu.className = "cuerdas";
-    NOMBRES.forEach(nm => { const s = document.createElement("span"); s.textContent = nm + "|"; cu.appendChild(s); });
-    bl.appendChild(cu);
-    eventos.slice(i, i + 14).forEach((ev, k) => {
-      const col = document.createElement("div"); col.className = "col"; col.id = "ev" + (i + k);
-      for (let r = 0; r < 6; r++) {
-        const nota = ev.notas.find(x => x.s === 5 - r);
-        const sp = document.createElement("span"); sp.textContent = nota ? nota.fr : "\u00A0";
-        col.appendChild(sp);
-      }
-      bl.appendChild(col);
-    });
-    cont.appendChild(bl);
+// ---------- Tempo y ritmo ----------
+function detectarBpm() {
+  if (eventos.length < 2) return 100;
+  const t0 = eventos[0].t; let mejor = 100, mejorS = -1e9;
+  for (let bpm = 70; bpm <= 160; bpm += 0.5) {
+    const p = 60 / bpm / 2; let s = 0;
+    for (const e of eventos) s += Math.cos(2 * Math.PI * (e.t - t0) / p);
+    s = s / eventos.length - 0.0004 * Math.abs(bpm - 110);
+    if (s > mejorS) { mejorS = s; mejor = bpm; }
   }
+  return Math.round(mejor);
 }
 
-// ---- Reproductor ----
-function tocarNota(midi, t, dur) {
-  const o = actx.createOscillator(), g = actx.createGain(), fl = actx.createBiquadFilter();
-  o.type = "sawtooth"; o.frequency.value = 440 * Math.pow(2, (midi - 69) / 12);
-  fl.type = "lowpass"; fl.frequency.setValueAtTime(3000, t); fl.frequency.exponentialRampToValueAtTime(500, t + 0.4);
-  const d = Math.min(Math.max(dur, 0.25), 1.5);
-  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.25, t + 0.01);
-  g.gain.exponentialRampToValueAtTime(0.0001, t + d);
-  o.connect(fl); fl.connect(g); g.connect(actx.destination); o.start(t); o.stop(t + d + 0.05);
-}
-function detener() {
-  timers.forEach(clearTimeout); timers = [];
-  if (actx) { actx.close(); actx = null; }
-  document.querySelectorAll(".col.on").forEach(c => c.classList.remove("on"));
-}
-$("btnStop").onclick = detener;
-$("btnPlay").onclick = () => {
-  detener(); actx = new (window.AudioContext || window.webkitAudioContext)();
-  const t0 = actx.currentTime + 0.2;
-  eventos.forEach((ev, i) => {
-    ev.notas.forEach(n => tocarNota(n.midi, t0 + ev.t, n.dur));
-    timers.push(setTimeout(() => {
-      document.querySelectorAll(".col.on").forEach(c => c.classList.remove("on"));
-      const c = $("ev" + i); if (c) { c.classList.add("on"); c.scrollIntoView({ block: "nearest" }); }
-    }, (0.2 + ev.t) * 1000));
+// duraciones permitidas en semicorcheas: [tamaño, código alphaTex, ¿con puntillo?]
+const PERM = [[16,"1",0],[12,"2",1],[8,"2",0],[6,"4",1],[4,"4",0],[3,"8",1],[2,"8",0],[1,"16",0]];
+function piezas(l) { const o = []; while (l > 0) { const a = PERM.find(x => x[0] <= l); o.push(a); l -= a[0]; } return o; }
+
+function armarTex(bpm, num, den, BAR) {
+  const step = 60 / bpm / 4, t0 = eventos[0].t;
+  // cuantizar a semicorcheas y unir los que caen en el mismo lugar
+  const q = [];
+  for (const e of eventos) {
+    const slot = Math.max(0, Math.round((e.t - t0) / step));
+    const len = Math.max(1, Math.round(Math.max(...e.notas.map(n => n.dur)) / step));
+    const last = q[q.length-1];
+    if (last && last.slot === slot) {
+      e.notas.forEach(n => { if (!last.notas.some(x => x.s === n.s)) last.notas.push(n); });
+      last.len = Math.max(last.len, len);
+    } else q.push({ slot, len, notas: e.notas.slice() });
+  }
+  const bars = [[]]; let pos = 0;
+  function emitir(esNota, len, notas) {
+    while (len > 0) {
+      const l = Math.min(len, BAR - (pos % BAR));
+      piezas(l).forEach((p, i) => {
+        let t = (esNota && i === 0) ? "(" + notas.map(n => n.fr + "." + (6 - n.s)).join(" ") + ")." + p[1] : "r." + p[1];
+        if (p[2]) t += " {d}";
+        bars[bars.length-1].push(t);
+      });
+      pos += l; len -= l;
+      if (pos % BAR === 0) bars.push([]);
+    }
+  }
+  q.forEach((e, i) => {
+    const gap = i + 1 < q.length ? q[i+1].slot - e.slot : e.len;
+    const largo = Math.max(1, Math.min(e.len, gap));
+    emitir(true, largo, e.notas);
+    if (gap > largo) emitir(false, gap - largo, null);
   });
-};
+  if (pos % BAR !== 0) emitir(false, BAR - (pos % BAR), null);
+  const cuerpo = bars.filter(b => b.length).map(b => b.join(" ")).join(" |\n");
+  return '\\title "Transcripción"\n\\tempo ' + bpm + "\n\\ts " + num + " " + den + "\n.\n" + cuerpo;
+}
 
-// ---- Exportar MIDI ----
+// ---------- Partitura + reproductor (alphaTab) ----------
+function iniciarApi() {
+  if (api) return;
+  api = new alphaTab.AlphaTabApi($("partitura"), {
+    core: { fontDirectory: AT + "font/" },
+    player: { enablePlayer: true, soundFont: AT + "soundfont/sonivox.sf2" }
+  });
+  api.playerReady.on(() => { playerListo = true; $("btnPlay").disabled = false; $("btnStop").disabled = false; });
+  api.error.on(e => { $("estado").textContent = "Error al dibujar la partitura: " + (e && e.message || e); });
+}
+
+function armarPartitura() {
+  if (!eventos.length) { $("estado").textContent = "No se detectaron notas. Sube la sensibilidad."; return; }
+  const [num, den, BAR] = $("comp").value.split(",").map(Number);
+  const bpmManual = parseFloat($("bpm").value);
+  const bpm = bpmManual > 0 ? Math.round(bpmManual) : detectarBpm();
+  iniciarApi();
+  try {
+    api.tex(armarTex(bpm, num, den, BAR));
+    $("estado").textContent = notasFinal.length + " notas detectadas. Tempo usado: " + bpm + " BPM, compás " + num + "/" + den + ".";
+  } catch (err) { $("estado").textContent = "Error al armar la partitura: " + err.message; }
+}
+$("bpm").onchange = () => { if (eventos.length) armarPartitura(); };
+$("comp").onchange = () => { if (eventos.length) armarPartitura(); };
+$("btnPlay").onclick = () => api && api.playPause();
+$("btnStop").onclick = () => api && api.stop();
+
+// ---------- Exportar MIDI ----------
 function vlq(v) { const b = [v & 127]; while ((v >>= 7)) b.unshift((v & 127) | 128); return b; }
 $("btnMidi").onclick = () => {
-  const TPS = 960; // 480 ticks por negra a 120 bpm
-  const ev = [];
+  const TPS = 960, ev = [];
   eventos.forEach(e => e.notas.forEach(n => {
     const ini = Math.round(e.t * TPS), fin = ini + Math.max(Math.round(n.dur * TPS), 60);
     ev.push([ini, 0x90, n.midi, 90], [fin, 0x80, n.midi, 0]);
