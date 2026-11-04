@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Audio a Tablatura</title>
+<style>
+:root{--bg:#14161a;--card:#1e2128;--tx:#e8e8ea;--ac:#f5a524;--mu:#8b8f99}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--tx);padding:16px;max-width:1000px;margin:auto}
+h1{font-size:1.4rem;margin:.2em 0}
+.card{background:var(--card);border-radius:12px;padding:14px;margin:12px 0}
+button{background:var(--ac);color:#000;border:0;border-radius:8px;padding:10px 16px;font-weight:700;cursor:pointer;margin:4px 4px 4px 0}
+button:disabled{opacity:.4;cursor:default}
+label{display:block;margin:8px 0;color:var(--mu);font-size:.9rem}
+input[type=range]{width:220px;vertical-align:middle}
+#estado{color:var(--mu);margin-top:8px}
+progress{width:100%;height:10px}
+#tab{display:flex;flex-wrap:wrap;gap:14px 0;font-family:monospace}
+.col{display:flex;flex-direction:column;align-items:center;padding:0 4px;border-radius:4px}
+.col span{height:20px;line-height:20px;min-width:22px;text-align:center;background:linear-gradient(transparent 9px,#555 9px,#555 10px,transparent 10px)}
+.col.on{background:var(--ac)}
+.col.on span{color:#000;font-weight:700}
+.bloque{display:flex;flex-wrap:nowrap;margin-right:10px;padding-right:6px;border-right:2px solid #555}
+.cuerdas{display:flex;flex-direction:column;color:var(--mu);font-family:monospace;padding-right:6px}
+.cuerdas span{height:20px;line-height:20px}
+small{color:var(--mu)}
+</style>
+</head>
+<body>
+<h1>🎸 Audio a Tablatura</h1>
+<small>Todo se procesa en tu navegador. No se sube nada a ningún servidor.</small>
+
+<div class="card">
+  <input type="file" id="archivo" accept="audio/*">
+  <label>Sensibilidad (más a la derecha = más notas)
+    <input type="range" id="sens" min="10" max="60" value="35"></label>
+  <label>Largo mínimo de nota (ms)
+    <input type="range" id="minlen" min="40" max="300" value="90"></label>
+  <button id="btnTrans" disabled>Transcribir</button>
+  <progress id="prog" value="0" max="1" hidden></progress>
+  <div id="estado">Elige un archivo de audio.</div>
+</div>
+
+<div class="card">
+  <button id="btnPlay" disabled>▶ Reproducir</button>
+  <button id="btnStop" disabled>■ Detener</button>
+  <button id="btnMidi" disabled>⬇ Descargar .mid</button>
+</div>
+
+<div class="card"><div id="tab"></div></div>
+
+<script type="module">
+import { BasicPitch, noteFramesToTime, addPitchBendsToNoteEvents, outputToNotesPoly }
+  from "https://esm.sh/@spotify/basic-pitch@1.0.1";
+
+const MODEL = "https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/model/model.json";
+const AFINACION = [40,45,50,55,59,64]; // E2 A2 D3 G3 B3 E4 (cuerda 0 = la más grave)
+const NOMBRES = ["E","B","G","D","A","E"]; // de arriba a abajo en pantalla
+const $ = id => document.getElementById(id);
+let audioBuf = null, eventos = [], notasFinal = [], actx = null, timers = [];
+
+$("archivo").onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  $("estado").textContent = "Leyendo audio...";
+  try {
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const dec = await ac.decodeAudioData(await f.arrayBuffer());
+    ac.close();
+    // pasar a mono 22050 Hz, que es lo que pide el modelo
+    const n = Math.ceil(dec.duration * 22050);
+    const off = new OfflineAudioContext(1, n, 22050);
+    const src = off.createBufferSource(); src.buffer = dec; src.connect(off.destination); src.start();
+    audioBuf = await off.startRendering();
+    $("estado").textContent = "Listo (" + dec.duration.toFixed(1) + " s). Pulsa Transcribir.";
+    $("btnTrans").disabled = false;
+  } catch (err) { $("estado").textContent = "No pude leer ese archivo: " + err.message; }
+};
+
+$("btnTrans").onclick = async () => {
+  $("btnTrans").disabled = true; $("prog").hidden = false; $("prog").value = 0;
+  $("estado").textContent = "Cargando modelo y analizando (la primera vez tarda más)...";
+  try {
+    const frames = [], onsets = [], contours = [];
+    const bp = new BasicPitch(MODEL);
+    await bp.evaluateModel(audioBuf.getChannelData(0),
+      (f,o,c) => { frames.push(...f); onsets.push(...o); contours.push(...c); },
+      p => { $("prog").value = p; });
+    const umbral = 1 - $("sens").value / 100; // sensibilidad -> umbral
+    const crudas = noteFramesToTime(addPitchBendsToNoteEvents(contours,
+      outputToNotesPoly(frames, onsets, umbral, umbral, 5)));
+    const minDur = $("minlen").value / 1000;
+    notasFinal = crudas.filter(n => n.pitchMidi >= 40 && n.pitchMidi <= 88 && n.durationSeconds >= minDur)
+      .sort((a,b) => a.startTimeSeconds - b.startTimeSeconds);
+    armarTablatura();
+    $("estado").textContent = notasFinal.length + " notas detectadas.";
+    ["btnPlay","btnStop","btnMidi"].forEach(i => $(i).disabled = !eventos.length);
+  } catch (err) { $("estado").textContent = "Error: " + err.message; }
+  $("prog").hidden = true; $("btnTrans").disabled = false;
+};
+
+// ---- Asignar cuerda y traste ----
+function armarTablatura() {
+  const grupos = [];
+  for (const n of notasFinal) {
+    const g = grupos[grupos.length-1];
+    if (g && n.startTimeSeconds - g.t < 0.06) g.notas.push(n);
+    else grupos.push({ t: n.startTimeSeconds, notas: [n] });
+  }
+  let pos = 5; // posición de la mano
+  eventos = [];
+  for (const g of grupos) {
+    const usadas = new Set(), res = [];
+    for (const n of g.notas.sort((a,b) => b.pitchMidi - a.pitchMidi).slice(0,6)) {
+      let mejor = null;
+      for (let s = 0; s < 6; s++) {
+        const fr = n.pitchMidi - AFINACION[s];
+        if (fr < 0 || fr > 22 || usadas.has(s)) continue;
+        const costo = Math.abs(fr - pos) + (fr > 12 ? 2 : 0) + (fr === 0 ? -1 : 0);
+        if (!mejor || costo < mejor.costo) mejor = { s, fr, costo };
+      }
+      if (mejor) { usadas.add(mejor.s); res.push({ s: mejor.s, fr: mejor.fr, midi: n.pitchMidi, dur: n.durationSeconds }); }
+    }
+    if (res.length) {
+      const trastes = res.filter(r => r.fr > 0).map(r => r.fr);
+      if (trastes.length) pos = Math.round(trastes.reduce((a,b)=>a+b,0) / trastes.length);
+      eventos.push({ t: g.t, notas: res });
+    }
+  }
+  dibujar();
+}
+
+function dibujar() {
+  const cont = $("tab"); cont.innerHTML = "";
+  for (let i = 0; i < eventos.length; i += 14) {
+    const bl = document.createElement("div"); bl.className = "bloque";
+    const cu = document.createElement("div"); cu.className = "cuerdas";
+    NOMBRES.forEach(nm => { const s = document.createElement("span"); s.textContent = nm + "|"; cu.appendChild(s); });
+    bl.appendChild(cu);
+    eventos.slice(i, i + 14).forEach((ev, k) => {
+      const col = document.createElement("div"); col.className = "col"; col.id = "ev" + (i + k);
+      for (let r = 0; r < 6; r++) {
+        const nota = ev.notas.find(x => x.s === 5 - r);
+        const sp = document.createElement("span"); sp.textContent = nota ? nota.fr : "\u00A0";
+        col.appendChild(sp);
+      }
+      bl.appendChild(col);
+    });
+    cont.appendChild(bl);
+  }
+}
+
+// ---- Reproductor ----
+function tocarNota(midi, t, dur) {
+  const o = actx.createOscillator(), g = actx.createGain(), fl = actx.createBiquadFilter();
+  o.type = "sawtooth"; o.frequency.value = 440 * Math.pow(2, (midi - 69) / 12);
+  fl.type = "lowpass"; fl.frequency.setValueAtTime(3000, t); fl.frequency.exponentialRampToValueAtTime(500, t + 0.4);
+  const d = Math.min(Math.max(dur, 0.25), 1.5);
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.25, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+  o.connect(fl); fl.connect(g); g.connect(actx.destination); o.start(t); o.stop(t + d + 0.05);
+}
+function detener() {
+  timers.forEach(clearTimeout); timers = [];
+  if (actx) { actx.close(); actx = null; }
+  document.querySelectorAll(".col.on").forEach(c => c.classList.remove("on"));
+}
+$("btnStop").onclick = detener;
+$("btnPlay").onclick = () => {
+  detener(); actx = new (window.AudioContext || window.webkitAudioContext)();
+  const t0 = actx.currentTime + 0.2;
+  eventos.forEach((ev, i) => {
+    ev.notas.forEach(n => tocarNota(n.midi, t0 + ev.t, n.dur));
+    timers.push(setTimeout(() => {
+      document.querySelectorAll(".col.on").forEach(c => c.classList.remove("on"));
+      const c = $("ev" + i); if (c) { c.classList.add("on"); c.scrollIntoView({ block: "nearest" }); }
+    }, (0.2 + ev.t) * 1000));
+  });
+};
+
+// ---- Exportar MIDI ----
+function vlq(v) { const b = [v & 127]; while ((v >>= 7)) b.unshift((v & 127) | 128); return b; }
+$("btnMidi").onclick = () => {
+  const TPS = 960; // 480 ticks por negra a 120 bpm
+  const ev = [];
+  eventos.forEach(e => e.notas.forEach(n => {
+    const ini = Math.round(e.t * TPS), fin = ini + Math.max(Math.round(n.dur * TPS), 60);
+    ev.push([ini, 0x90, n.midi, 90], [fin, 0x80, n.midi, 0]);
+  }));
+  ev.sort((a,b) => a[0] - b[0] || a[1] - b[1]);
+  let trk = [0, 0xFF, 0x51, 3, 0x07, 0xA1, 0x20], ult = 0;
+  ev.forEach(x => { trk.push(...vlq(x[0] - ult), x[1], x[2], x[3]); ult = x[0]; });
+  trk.push(0, 0xFF, 0x2F, 0);
+  const h = [0x4D,0x54,0x68,0x64,0,0,0,6,0,0,0,1,0x01,0xE0];
+  const L = trk.length, tr = [0x4D,0x54,0x72,0x6B,(L>>24)&255,(L>>16)&255,(L>>8)&255,L&255];
+  const blob = new Blob([new Uint8Array([...h, ...tr, ...trk])], { type: "audio/midi" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "tablatura.mid"; a.click();
+};
+</script>
+</body>
+</html>
