@@ -4,7 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Audio a Tablatura</title>
-<script src="https://cdn.jsdelivr.net/npm/@coderline/alphatab@1.5.0/dist/alphaTab.js"></script>
 <style>
 :root{--bg:#14161a;--card:#1e2128;--tx:#e8e8ea;--ac:#f5a524;--mu:#8b8f99}
 *{box-sizing:border-box}
@@ -15,11 +14,30 @@ button{background:var(--ac);color:#000;border:0;border-radius:8px;padding:10px 1
 button:disabled{opacity:.4;cursor:default}
 label{display:block;margin:8px 0;color:var(--mu);font-size:.9rem}
 input[type=range]{width:220px;vertical-align:middle}
-input[type=number],select{background:#2a2e37;color:var(--tx);border:1px solid #444;border-radius:6px;padding:6px;width:110px}
+input[type=number],select{background:#2a2e37;color:var(--tx);border:1px solid #444;border-radius:6px;padding:6px}
+input[type=number]{width:110px}
 #estado{color:var(--mu);margin-top:8px}
 progress{width:100%;height:10px}
-#partitura{background:#fff;color:#000;border-radius:12px;padding:10px;min-height:120px}
 small{color:var(--mu)}
+/* tablatura */
+#tab{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:flex-start}
+.compas{display:flex;flex-direction:column;border-left:2px solid #888;padding-left:4px}
+.num{color:var(--mu);font-size:.7rem}
+.fila2{display:flex;font-family:monospace}
+.cuerdas{display:flex;flex-direction:column;color:var(--mu);padding-right:4px}
+.cuerdas span{height:20px;line-height:20px}
+.col{display:flex;flex-direction:column;align-items:center;border-radius:4px}
+.col span{height:20px;line-height:20px;width:100%;text-align:center;background:linear-gradient(transparent 9px,#666 9px,#666 10px,transparent 10px)}
+.col.on{background:var(--ac)}
+.col.on span{color:#000;font-weight:700}
+.ritmo{position:relative;height:30px;width:100%;color:var(--tx)}
+.col.on .ritmo{color:#000}
+.tallo{position:absolute;left:50%;top:2px;height:18px;border-left:2px solid currentColor}
+.hueca::after{content:"";position:absolute;left:-6px;bottom:-3px;width:8px;height:6px;border:2px solid currentColor;border-radius:50%}
+.banda{position:absolute;left:50%;height:3px;width:9px;background:currentColor}
+.redonda{position:absolute;left:calc(50% - 6px);top:6px;width:12px;height:8px;border:2px solid currentColor;border-radius:50%}
+.ritmo b{position:absolute;left:calc(50% + 5px);top:12px;font-size:14px;line-height:1}
+.silencio{opacity:.35}
 </style>
 </head>
 <body>
@@ -28,13 +46,21 @@ small{color:var(--mu)}
 
 <div class="card">
   <input type="file" id="archivo" accept="audio/*">
+  <label>Cómo aislar la guitarra
+    <select id="metodo">
+      <option value="rapido">Rápido y liviano (aproximado)</option>
+      <option value="preciso">Preciso y lento (Demucs, baja ~136 MB)</option>
+      <option value="ninguno">Ninguno (el audio ya es solo guitarra)</option>
+    </select></label>
   <label>Sensibilidad (más a la derecha = más notas)
     <input type="range" id="sens" min="10" max="60" value="35"></label>
   <label>Largo mínimo de nota (ms)
     <input type="range" id="minlen" min="40" max="300" value="90"></label>
   <button id="btnTrans" disabled>Transcribir</button>
+  <button id="btnCancel" hidden style="background:#666;color:#fff">Cancelar</button>
   <progress id="prog" value="0" max="1" hidden></progress>
   <div id="estado">Elige un archivo de audio.</div>
+  <audio id="stem" controls hidden style="width:100%;margin-top:8px"></audio>
 </div>
 
 <div class="card">
@@ -42,69 +68,200 @@ small{color:var(--mu)}
     <input type="number" id="bpm" min="40" max="220" placeholder="auto"></label>
   <label>Compás
     <select id="comp">
-      <option value="4,4,16">4/4</option>
-      <option value="3,4,12">3/4</option>
-      <option value="2,4,8">2/4</option>
-      <option value="6,8,12">6/8</option>
+      <option value="16">4/4</option>
+      <option value="12">3/4</option>
+      <option value="8">2/4</option>
     </select></label>
-  <small>Si la partitura sale “corrida” o con ritmos raros, prueba a escribir el tempo a mano (o la mitad / el doble del que detectó).</small>
+  <small>Si el ritmo sale raro, escribe el tempo a mano (o la mitad / el doble del detectado).</small>
 </div>
 
 <div class="card">
-  <button id="btnPlay" disabled>▶ Reproducir / Pausa</button>
+  <button id="btnPlay" disabled>▶ Reproducir</button>
   <button id="btnStop" disabled>■ Detener</button>
   <button id="btnMidi" disabled>⬇ Descargar .mid</button>
 </div>
 
-<div id="partitura"></div>
+<div class="card"><div id="tab">La tablatura aparecerá aquí.</div></div>
 
 <script type="module">
 import { BasicPitch, noteFramesToTime, addPitchBendsToNoteEvents, outputToNotesPoly }
   from "https://esm.sh/@spotify/basic-pitch@1.0.1";
 
 const MODEL = "https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/model/model.json";
-const AT = "https://cdn.jsdelivr.net/npm/@coderline/alphatab@1.5.0/dist/";
+const MODELO = "https://huggingface.co/StemSplitio/htdemucs-6s-onnx/resolve/main/htdemucs_6s_fp16weights.onnx";
+const ORT = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
 const AFINACION = [40,45,50,55,59,64]; // E2 A2 D3 G3 B3 E4 (índice 0 = cuerda más grave)
+const NOMBRES = ["e","B","G","D","A","E"];
 const $ = id => document.getElementById(id);
-let audioBuf = null, eventos = [], notasFinal = [], api = null, playerListo = false;
+let dec = null, cancelar = false, stemUrl = null;
+let eventos = [], notasFinal = [], ultimo = null, actx = null, timers = [];
+
+window.addEventListener("error", e => { $("estado").textContent = "Error: " + e.message; });
+window.addEventListener("unhandledrejection", e => { $("estado").textContent = "Error: " + (e.reason && e.reason.message || e.reason); });
 
 // ---------- Audio ----------
+async function remuestrear(buf, rate, canales) {
+  const off = new OfflineAudioContext(canales, Math.ceil(buf.duration * rate), rate);
+  const src = off.createBufferSource(); src.buffer = buf; src.connect(off.destination); src.start();
+  return off.startRendering();
+}
+async function filtrarAudio(buf) { // quita graves (bajo) y agudos (platillos)
+  const off = new OfflineAudioContext(1, buf.length, buf.sampleRate);
+  const src = off.createBufferSource(); src.buffer = buf;
+  const hp = off.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 90;
+  const lp = off.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 3000;
+  src.connect(hp); hp.connect(lp); lp.connect(off.destination); src.start();
+  return off.startRendering();
+}
 $("archivo").onchange = async e => {
   const f = e.target.files[0]; if (!f) return;
   $("estado").textContent = "Leyendo audio...";
   try {
     const ac = new (window.AudioContext || window.webkitAudioContext)();
-    const dec = await ac.decodeAudioData(await f.arrayBuffer());
+    dec = await ac.decodeAudioData(await f.arrayBuffer());
     ac.close();
-    const n = Math.ceil(dec.duration * 22050);
-    const off = new OfflineAudioContext(1, n, 22050);
-    const src = off.createBufferSource(); src.buffer = dec; src.connect(off.destination); src.start();
-    audioBuf = await off.startRendering();
     $("estado").textContent = "Listo (" + dec.duration.toFixed(1) + " s). Pulsa Transcribir.";
     $("btnTrans").disabled = false;
   } catch (err) { $("estado").textContent = "No pude leer ese archivo: " + err.message; }
 };
+$("btnCancel").onclick = () => { cancelar = true; };
 
-$("btnTrans").onclick = async () => {
-  $("btnTrans").disabled = true; $("prog").hidden = false; $("prog").value = 0;
-  $("estado").textContent = "Cargando modelo y analizando (la primera vez tarda más)...";
+// ---------- Separación precisa (Demucs 6 stems) ----------
+async function bajarModelo() {
+  let cache = null;
   try {
+    cache = await caches.open("demucs-modelo");
+    const hit = await cache.match(MODELO);
+    if (hit) return new Uint8Array(await hit.arrayBuffer());
+  } catch (e) {}
+  const r = await fetch(MODELO);
+  if (!r.ok) throw new Error("No pude bajar el modelo (" + r.status + ")");
+  const total = +r.headers.get("content-length") || 0;
+  const rd = r.body.getReader(), partes = []; let got = 0;
+  for (;;) {
+    const { done, value } = await rd.read(); if (done) break;
+    partes.push(value); got += value.length;
+    if (cancelar) throw new Error("Cancelado");
+    $("prog").value = total ? got / total : 0;
+    $("estado").textContent = "Bajando el modelo de separación: " + (got / 1048576).toFixed(0) + " MB" +
+      (total ? " de " + (total / 1048576).toFixed(0) : "") + " (solo la primera vez)";
+  }
+  const bytes = new Uint8Array(got); let o = 0;
+  for (const p of partes) { bytes.set(p, o); o += p.length; }
+  try { if (cache) await cache.put(MODELO, new Response(bytes.slice())); } catch (e) {}
+  return bytes;
+}
+function wavBlob(L, R, sr) {
+  const n = L.length, b = new ArrayBuffer(44 + n * 4), v = new DataView(b);
+  const str = (o, t) => { for (let k = 0; k < t.length; k++) v.setUint8(o + k, t.charCodeAt(k)); };
+  str(0, "RIFF"); v.setUint32(4, 36 + n * 4, true); str(8, "WAVEfmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  str(36, "data"); v.setUint32(40, n * 4, true);
+  const c = x => Math.max(-1, Math.min(1, x)) * 32767;
+  for (let i = 0; i < n; i++) { v.setInt16(44 + i * 4, c(L[i]), true); v.setInt16(46 + i * 4, c(R[i]), true); }
+  return new Blob([b], { type: "audio/wav" });
+}
+async function separarGuitarra() {
+  $("estado").textContent = "Preparando el separador...";
+  const ort = await import(ORT + "ort.min.mjs");
+  ort.env.wasm.wasmPaths = ORT;
+  ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
+  const bytes = await bajarModelo();
+  $("estado").textContent = "Cargando el modelo en memoria...";
+  const sess = await ort.InferenceSession.create(bytes, { executionProviders: ["wasm"] });
+  const st = await remuestrear(dec, 44100, 2);
+  const N = st.length, L = st.getChannelData(0), R = st.numberOfChannels > 1 ? st.getChannelData(1) : L;
+  let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] + R[i]) / 2;
+  const mean = sum / N; let vr = 0;
+  for (let i = 0; i < N; i++) { const d = (L[i] + R[i]) / 2 - mean; vr += d * d; }
+  const std = Math.sqrt(vr / N) || 1;
+  const S = 343980, hop = Math.floor(S * 0.75);
+  const outL = new Float32Array(N), outR = new Float32Array(N), peso = new Float32Array(N);
+  const win = new Float32Array(S);
+  for (let i = 0; i < S; i++) win[i] = Math.min(i + 1, S - i) / (S / 2);
+  const total = Math.ceil(Math.max(0, N - S) / hop) + 1;
+  const t0 = performance.now(); let k = 0;
+  for (let start = 0; ; start += hop) {
+    if (cancelar) throw new Error("Cancelado");
+    const len = Math.min(S, N - start), inp = new Float32Array(2 * S);
+    for (let i = 0; i < len; i++) { inp[i] = (L[start + i] - mean) / std; inp[S + i] = (R[start + i] - mean) / std; }
+    const res = await sess.run({ mix: new ort.Tensor("float32", inp, [1, 2, S]) });
+    const d = res.stems.data, oL = 8 * S, oR = 9 * S; // stem 4 = guitarra
+    for (let i = 0; i < len; i++) {
+      const w = win[i];
+      outL[start + i] += d[oL + i] * w; outR[start + i] += d[oR + i] * w; peso[start + i] += w;
+    }
+    k++; $("prog").value = k / total;
+    const resta = (performance.now() - t0) / k * (total - k) / 60000;
+    $("estado").textContent = "Separando la guitarra: bloque " + k + " de " + total +
+      (k > 1 ? " — faltan unos " + Math.max(1, Math.round(resta)) + " min" : "");
+    await new Promise(r => setTimeout(r, 0));
+    if (start + S >= N) break;
+  }
+  try { await sess.release(); } catch (e) {}
+  const mono = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const w = peso[i] || 1;
+    outL[i] = outL[i] / w * std + mean; outR[i] = outR[i] / w * std + mean;
+    mono[i] = (outL[i] + outR[i]) / 2;
+  }
+  if (stemUrl) URL.revokeObjectURL(stemUrl);
+  stemUrl = URL.createObjectURL(wavBlob(outL, outR, 44100));
+  $("stem").src = stemUrl; $("stem").hidden = false;
+  const ab = new AudioBuffer({ length: N, sampleRate: 44100, numberOfChannels: 1 });
+  ab.copyToChannel(mono, 0);
+  return remuestrear(ab, 22050, 1);
+}
+
+// ---------- Selección rápida de notas de guitarra ----------
+function filtroRapido(ns) {
+  if (ns.length < 8) return ns;
+  const a = ns.map(n => n.amplitude).sort((x, y) => x - y);
+  const thr = a[Math.floor(a.length * 0.35)];
+  const k = ns.filter(n => n.amplitude >= thr).sort((x, y) => x.startTimeSeconds - y.startTimeSeconds);
+  const out = []; let i = 0;
+  while (i < k.length) {
+    let j = i; const g = [k[i]];
+    while (j + 1 < k.length && k[j+1].startTimeSeconds - k[i].startTimeSeconds < 0.06) g.push(k[++j]);
+    g.sort((x, y) => y.amplitude - x.amplitude); out.push(...g.slice(0, 4)); i = j + 1;
+  }
+  return out;
+}
+
+// ---------- Transcripción ----------
+$("btnTrans").onclick = async () => {
+  cancelar = false; $("btnTrans").disabled = true; $("btnCancel").hidden = false;
+  $("prog").hidden = false; $("prog").value = 0; $("stem").hidden = true;
+  try {
+    const metodo = $("metodo").value;
+    let mono;
+    if (metodo === "preciso") mono = await separarGuitarra();
+    else {
+      $("estado").textContent = "Preparando el audio...";
+      mono = await remuestrear(dec, 22050, 1);
+      if (metodo === "rapido") mono = await filtrarAudio(mono);
+    }
+    $("prog").value = 0;
+    $("estado").textContent = "Detectando notas (la primera vez baja el modelo de notas)...";
     const frames = [], onsets = [], contours = [];
     const bp = new BasicPitch(MODEL);
-    await bp.evaluateModel(audioBuf.getChannelData(0),
+    await bp.evaluateModel(mono.getChannelData(0),
       (f,o,c) => { frames.push(...f); onsets.push(...o); contours.push(...c); },
       p => { $("prog").value = p; });
     const umbral = 1 - $("sens").value / 100;
     const crudas = noteFramesToTime(addPitchBendsToNoteEvents(contours,
       outputToNotesPoly(frames, onsets, umbral, umbral, 5)));
     const minDur = $("minlen").value / 1000;
-    notasFinal = crudas.filter(n => n.pitchMidi >= 40 && n.pitchMidi <= 88 && n.durationSeconds >= minDur)
-      .sort((a,b) => a.startTimeSeconds - b.startTimeSeconds);
+    let lista = crudas.filter(n => n.pitchMidi >= 40 && n.pitchMidi <= 88 && n.durationSeconds >= minDur);
+    if (metodo === "rapido") lista = filtroRapido(lista);
+    notasFinal = lista.sort((a,b) => a.startTimeSeconds - b.startTimeSeconds);
     asignarCuerdas();
-    $("btnMidi").disabled = !eventos.length;
     armarPartitura();
-  } catch (err) { $("estado").textContent = "Error: " + err.message; }
-  $("prog").hidden = true; $("btnTrans").disabled = false;
+  } catch (err) {
+    $("estado").textContent = err.message === "Cancelado" ? "Cancelado." : "Error: " + err.message;
+  }
+  $("prog").hidden = true; $("btnCancel").hidden = true; $("btnTrans").disabled = false;
 };
 
 // ---------- Cuerda y traste ----------
@@ -136,7 +293,7 @@ function asignarCuerdas() {
   }
 }
 
-// ---------- Tempo y ritmo ----------
+// ---------- Tempo, compases y duraciones ----------
 function detectarBpm() {
   if (eventos.length < 2) return 100;
   const t0 = eventos[0].t; let mejor = 100, mejorS = -1e9;
@@ -148,15 +305,12 @@ function detectarBpm() {
   }
   return Math.round(mejor);
 }
-
-// duraciones permitidas en semicorcheas: [tamaño, código alphaTex, ¿con puntillo?]
+// [tamaño en semicorcheas, figura, ¿con puntillo?]
 const PERM = [[16,"1",0],[12,"2",1],[8,"2",0],[6,"4",1],[4,"4",0],[3,"8",1],[2,"8",0],[1,"16",0]];
 function piezas(l) { const o = []; while (l > 0) { const a = PERM.find(x => x[0] <= l); o.push(a); l -= a[0]; } return o; }
 
-function armarTex(bpm, num, den, BAR) {
-  const step = 60 / bpm / 4, t0 = eventos[0].t;
-  // cuantizar a semicorcheas y unir los que caen en el mismo lugar
-  const q = [];
+function construir(bpm, BAR) {
+  const step = 60 / bpm / 4, t0 = eventos[0].t, q = [];
   for (const e of eventos) {
     const slot = Math.max(0, Math.round((e.t - t0) / step));
     const len = Math.max(1, Math.round(Math.max(...e.notas.map(n => n.dur)) / step));
@@ -166,16 +320,15 @@ function armarTex(bpm, num, den, BAR) {
       last.len = Math.max(last.len, len);
     } else q.push({ slot, len, notas: e.notas.slice() });
   }
-  const bars = [[]]; let pos = 0;
+  const bars = [[]], todas = []; let pos = 0;
   function emitir(esNota, len, notas) {
     while (len > 0) {
       const l = Math.min(len, BAR - (pos % BAR));
       piezas(l).forEach((p, i) => {
-        let t = (esNota && i === 0) ? "(" + notas.map(n => n.fr + "." + (6 - n.s)).join(" ") + ")." + p[1] : "r." + p[1];
-        if (p[2]) t += " {d}";
-        bars[bars.length-1].push(t);
+        const it = { i: todas.length, pos, len: p[0], dur: p[1], pt: p[2], notas: (esNota && i === 0) ? notas : null };
+        bars[bars.length-1].push(it); todas.push(it); pos += p[0];
       });
-      pos += l; len -= l;
+      len -= l;
       if (pos % BAR === 0) bars.push([]);
     }
   }
@@ -186,47 +339,96 @@ function armarTex(bpm, num, den, BAR) {
     if (gap > largo) emitir(false, gap - largo, null);
   });
   if (pos % BAR !== 0) emitir(false, BAR - (pos % BAR), null);
-  const cuerpo = bars.filter(b => b.length).map(b => b.join(" ")).join(" |\n");
-  return '\\title "Transcripción"\n\\tempo ' + bpm + "\n\\ts " + num + " " + den + "\n.\n" + cuerpo;
+  return { bars: bars.filter(b => b.length), todas, step, bpm };
 }
 
-// ---------- Partitura + reproductor (alphaTab) ----------
-function iniciarApi() {
-  if (api) return;
-  api = new alphaTab.AlphaTabApi($("partitura"), {
-    core: { fontDirectory: AT + "font/" },
-    player: { enablePlayer: true, soundFont: AT + "soundfont/sonivox.sf2" }
+function ritmoHtml(it) {
+  const c = it.dur;
+  let h = '<div class="ritmo' + (it.notas ? "" : " silencio") + '">';
+  if (c === "1") h += '<i class="redonda"></i>';
+  else {
+    h += '<i class="tallo' + (c === "2" ? " hueca" : "") + '"></i>';
+    if (c === "8" || c === "16") h += '<i class="banda" style="top:2px"></i>';
+    if (c === "16") h += '<i class="banda" style="top:8px"></i>';
+  }
+  if (it.pt) h += "<b>•</b>";
+  return h + "</div>";
+}
+
+function dibujar(r) {
+  let h = "";
+  r.bars.forEach((bar, n) => {
+    h += '<div class="compas"><div class="num">compás ' + (n + 1) + '</div><div class="fila2"><div class="cuerdas">' +
+      NOMBRES.map(x => "<span>" + x + "</span>").join("") + "</div>";
+    bar.forEach(it => {
+      h += '<div class="col" id="c' + it.i + '" style="width:' + (20 + it.len * 7) + 'px">';
+      for (let row = 0; row < 6; row++) {
+        const nota = it.notas && it.notas.find(x => x.s === 5 - row);
+        h += "<span>" + (nota ? nota.fr : "&nbsp;") + "</span>";
+      }
+      h += ritmoHtml(it) + "</div>";
+    });
+    h += "</div></div>";
   });
-  api.playerReady.on(() => { playerListo = true; $("btnPlay").disabled = false; $("btnStop").disabled = false; });
-  api.error.on(e => { $("estado").textContent = "Error al dibujar la partitura: " + (e && e.message || e); });
+  $("tab").innerHTML = h;
 }
 
 function armarPartitura() {
   if (!eventos.length) { $("estado").textContent = "No se detectaron notas. Sube la sensibilidad."; return; }
-  const [num, den, BAR] = $("comp").value.split(",").map(Number);
-  const bpmManual = parseFloat($("bpm").value);
-  const bpm = bpmManual > 0 ? Math.round(bpmManual) : detectarBpm();
-  iniciarApi();
-  try {
-    api.tex(armarTex(bpm, num, den, BAR));
-    $("estado").textContent = notasFinal.length + " notas detectadas. Tempo usado: " + bpm + " BPM, compás " + num + "/" + den + ".";
-  } catch (err) { $("estado").textContent = "Error al armar la partitura: " + err.message; }
+  const BAR = +$("comp").value;
+  const manual = parseFloat($("bpm").value);
+  const bpm = manual > 0 ? Math.round(manual) : detectarBpm();
+  ultimo = construir(bpm, BAR);
+  dibujar(ultimo);
+  ["btnPlay","btnStop","btnMidi"].forEach(i => $(i).disabled = false);
+  $("estado").textContent = notasFinal.length + " notas, " + ultimo.bars.length + " compases. Tempo usado: " + bpm + " BPM.";
 }
 $("bpm").onchange = () => { if (eventos.length) armarPartitura(); };
 $("comp").onchange = () => { if (eventos.length) armarPartitura(); };
-$("btnPlay").onclick = () => api && api.playPause();
-$("btnStop").onclick = () => api && api.stop();
+
+// ---------- Reproductor ----------
+function tocarNota(midi, t, dur) {
+  const o = actx.createOscillator(), g = actx.createGain(), fl = actx.createBiquadFilter();
+  o.type = "sawtooth"; o.frequency.value = 440 * Math.pow(2, (midi - 69) / 12);
+  fl.type = "lowpass"; fl.frequency.setValueAtTime(3000, t); fl.frequency.exponentialRampToValueAtTime(500, t + 0.4);
+  const d = Math.min(Math.max(dur, 0.25), 1.5);
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.25, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+  o.connect(fl); fl.connect(g); g.connect(actx.destination); o.start(t); o.stop(t + d + 0.05);
+}
+function detener() {
+  timers.forEach(clearTimeout); timers = [];
+  if (actx) { actx.close(); actx = null; }
+  document.querySelectorAll(".col.on").forEach(c => c.classList.remove("on"));
+}
+$("btnStop").onclick = detener;
+$("btnPlay").onclick = () => {
+  if (!ultimo) return;
+  detener(); actx = new (window.AudioContext || window.webkitAudioContext)();
+  const t0 = actx.currentTime + 0.2, step = ultimo.step;
+  ultimo.todas.forEach(it => {
+    if (!it.notas) return;
+    it.notas.forEach(n => tocarNota(n.midi, t0 + it.pos * step, it.len * step));
+    timers.push(setTimeout(() => {
+      document.querySelectorAll(".col.on").forEach(c => c.classList.remove("on"));
+      const c = $("c" + it.i); if (c) { c.classList.add("on"); c.scrollIntoView({ block: "nearest" }); }
+    }, (0.2 + it.pos * step) * 1000));
+  });
+  const fin = ultimo.todas.length ? (ultimo.todas[ultimo.todas.length-1].pos + 4) * step : 0;
+  timers.push(setTimeout(detener, (0.5 + fin) * 1000));
+};
 
 // ---------- Exportar MIDI ----------
 function vlq(v) { const b = [v & 127]; while ((v >>= 7)) b.unshift((v & 127) | 128); return b; }
 $("btnMidi").onclick = () => {
-  const TPS = 960, ev = [];
-  eventos.forEach(e => e.notas.forEach(n => {
-    const ini = Math.round(e.t * TPS), fin = ini + Math.max(Math.round(n.dur * TPS), 60);
-    ev.push([ini, 0x90, n.midi, 90], [fin, 0x80, n.midi, 0]);
-  }));
+  if (!ultimo) return;
+  const ev = [];
+  ultimo.todas.forEach(it => { if (it.notas) it.notas.forEach(n => {
+    ev.push([it.pos * 120, 0x90, n.midi, 90], [(it.pos + it.len) * 120, 0x80, n.midi, 0]);
+  }); });
   ev.sort((a,b) => a[0] - b[0] || a[1] - b[1]);
-  let trk = [0, 0xFF, 0x51, 3, 0x07, 0xA1, 0x20], ult = 0;
+  const us = Math.round(60000000 / ultimo.bpm);
+  let trk = [0, 0xFF, 0x51, 3, (us >> 16) & 255, (us >> 8) & 255, us & 255], ult = 0;
   ev.forEach(x => { trk.push(...vlq(x[0] - ult), x[1], x[2], x[3]); ult = x[0]; });
   trk.push(0, 0xFF, 0x2F, 0);
   const h = [0x4D,0x54,0x68,0x64,0,0,0,6,0,0,0,1,0x01,0xE0];
