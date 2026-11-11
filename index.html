@@ -53,9 +53,9 @@ small{color:var(--mu)}
       <option value="ninguno">Ninguno (el audio ya es solo guitarra)</option>
     </select></label>
   <label>Sensibilidad (más a la derecha = más notas)
-    <input type="range" id="sens" min="10" max="60" value="35"></label>
+    <input type="range" id="sens" min="10" max="60" value="30"></label>
   <label>Largo mínimo de nota (ms)
-    <input type="range" id="minlen" min="40" max="300" value="90"></label>
+    <input type="range" id="minlen" min="30" max="300" value="70"></label>
   <button id="btnTrans" disabled>Transcribir</button>
   <button id="btnCancel" hidden style="background:#666;color:#fff">Cancelar</button>
   <progress id="prog" value="0" max="1" hidden></progress>
@@ -108,7 +108,7 @@ async function remuestrear(buf, rate, canales) {
 async function filtrarAudio(buf) { // quita graves (bajo) y agudos (platillos)
   const off = new OfflineAudioContext(1, buf.length, buf.sampleRate);
   const src = off.createBufferSource(); src.buffer = buf;
-  const hp = off.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 90;
+  const hp = off.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 70;
   const lp = off.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 3000;
   src.connect(hp); hp.connect(lp); lp.connect(off.destination); src.start();
   return off.startRendering();
@@ -218,15 +218,52 @@ async function separarGuitarra() {
 function filtroRapido(ns) {
   if (ns.length < 8) return ns;
   const a = ns.map(n => n.amplitude).sort((x, y) => x - y);
-  const thr = a[Math.floor(a.length * 0.35)];
+  const thr = a[Math.floor(a.length * 0.2)];
   const k = ns.filter(n => n.amplitude >= thr).sort((x, y) => x.startTimeSeconds - y.startTimeSeconds);
   const out = []; let i = 0;
   while (i < k.length) {
     let j = i; const g = [k[i]];
-    while (j + 1 < k.length && k[j+1].startTimeSeconds - k[i].startTimeSeconds < 0.06) g.push(k[++j]);
-    g.sort((x, y) => y.amplitude - x.amplitude); out.push(...g.slice(0, 4)); i = j + 1;
+    while (j + 1 < k.length && k[j+1].startTimeSeconds - k[i].startTimeSeconds < 0.07) g.push(k[++j]);
+    g.sort((x, y) => y.amplitude - x.amplitude); out.push(...g.slice(0, 6)); i = j + 1;
   }
   return out;
+}
+
+// Une los deslizamientos (slides): las notas cortas de paso se absorben en la nota anterior
+// para que el sonido no se corte, sin escribirlas como notas aparte.
+function unirDeslizados(crudas, minDur) {
+  const ns = crudas.filter(n => n.pitchMidi >= 40 && n.pitchMidi <= 88)
+    .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
+  const largas = ns.filter(n => n.durationSeconds >= minDur).map(n => ({ ...n }));
+  const cortas = ns.filter(n => n.durationSeconds < minDur);
+  for (const k of largas) {
+    let fin = k.startTimeSeconds + k.durationSeconds, ult = k.pitchMidi, algo = true;
+    while (algo) {
+      algo = false;
+      for (const c of cortas) {
+        if (c.usada) continue;
+        const ini = c.startTimeSeconds;
+        if (ini > fin + 0.08) break;
+        if (ini >= fin - 0.03 && Math.abs(c.pitchMidi - ult) <= 4) {
+          fin = Math.max(fin, ini + c.durationSeconds); ult = c.pitchMidi; c.usada = true; algo = true; break;
+        }
+      }
+    }
+    k.durationSeconds = fin - k.startTimeSeconds;
+  }
+  // rellenar huecos pequeños antes de la siguiente nota (hammer-on, pull-off, slide)
+  for (let i = 0; i < largas.length; i++) {
+    const k = largas[i], fin = k.startTimeSeconds + k.durationSeconds;
+    for (let j = i + 1; j < largas.length; j++) {
+      const n = largas[j];
+      if (n.startTimeSeconds <= k.startTimeSeconds + 0.03) continue;
+      const hueco = n.startTimeSeconds - fin;
+      if (Math.abs(n.pitchMidi - k.pitchMidi) <= 12 && hueco > -0.5 && hueco < 0.1)
+        k.durationSeconds = n.startTimeSeconds - k.startTimeSeconds;
+      break;
+    }
+  }
+  return largas;
 }
 
 // ---------- Transcripción ----------
@@ -249,11 +286,11 @@ $("btnTrans").onclick = async () => {
     await bp.evaluateModel(mono.getChannelData(0),
       (f,o,c) => { frames.push(...f); onsets.push(...o); contours.push(...c); },
       p => { $("prog").value = p; });
-    const umbral = 1 - $("sens").value / 100;
+    const onset = Math.min(0.9, Math.max(0.15, 0.8 - $("sens").value / 100));
+    const frame = Math.max(0.1, onset - 0.2);
     const crudas = noteFramesToTime(addPitchBendsToNoteEvents(contours,
-      outputToNotesPoly(frames, onsets, umbral, umbral, 5)));
-    const minDur = $("minlen").value / 1000;
-    let lista = crudas.filter(n => n.pitchMidi >= 40 && n.pitchMidi <= 88 && n.durationSeconds >= minDur);
+      outputToNotesPoly(frames, onsets, onset, frame, 3, true, null, null, true, 11)));
+    let lista = unirDeslizados(crudas, $("minlen").value / 1000);
     if (metodo === "rapido") lista = filtroRapido(lista);
     notasFinal = lista.sort((a,b) => a.startTimeSeconds - b.startTimeSeconds);
     asignarCuerdas();
@@ -265,31 +302,49 @@ $("btnTrans").onclick = async () => {
 };
 
 // ---------- Cuerda y traste ----------
+function asignar(ns, pos) {
+  const cand = ns.map(n => {
+    const c = [];
+    for (let s = 0; s < 6; s++) { const fr = n.pitchMidi - AFINACION[s]; if (fr >= 0 && fr <= 22) c.push({ s, fr }); }
+    return c;
+  });
+  let best = null, bestC = 1e9; const cur = [];
+  (function rec(i, usadas, costo) {
+    if (costo >= bestC) return;
+    if (i === ns.length) {
+      const fr = cur.filter(x => x.fr > 0).map(x => x.fr);
+      const span = fr.length ? Math.max(...fr) - Math.min(...fr) : 0;
+      const tot = costo + span * 0.5 + (span > 4 ? (span - 4) * 3 : 0);
+      if (tot < bestC) { bestC = tot; best = cur.slice(); }
+      return;
+    }
+    for (const c of cand[i]) {
+      if (usadas & (1 << c.s)) continue;
+      cur[i] = c;
+      rec(i + 1, usadas | (1 << c.s), costo + Math.abs(c.fr - pos) + (c.fr > 12 ? 2 : 0) + (c.fr === 0 ? -1 : 0));
+    }
+  })(0, 0, 0);
+  return best;
+}
+
 function asignarCuerdas() {
   const grupos = [];
   for (const n of notasFinal) {
     const g = grupos[grupos.length-1];
-    if (g && n.startTimeSeconds - g.t < 0.06) g.notas.push(n);
+    if (g && n.startTimeSeconds - g.t < 0.07) g.notas.push(n);
     else grupos.push({ t: n.startTimeSeconds, notas: [n] });
   }
   let pos = 5; eventos = [];
   for (const g of grupos) {
-    const usadas = new Set(), res = [];
-    for (const n of g.notas.sort((a,b) => b.pitchMidi - a.pitchMidi).slice(0,6)) {
-      let mejor = null;
-      for (let s = 0; s < 6; s++) {
-        const fr = n.pitchMidi - AFINACION[s];
-        if (fr < 0 || fr > 22 || usadas.has(s)) continue;
-        const costo = Math.abs(fr - pos) + (fr > 12 ? 2 : 0) + (fr === 0 ? -1 : 0);
-        if (!mejor || costo < mejor.costo) mejor = { s, fr, costo };
-      }
-      if (mejor) { usadas.add(mejor.s); res.push({ s: mejor.s, fr: mejor.fr, midi: n.pitchMidi, dur: n.durationSeconds }); }
-    }
-    if (res.length) {
-      const tr = res.filter(r => r.fr > 0).map(r => r.fr);
-      if (tr.length) pos = Math.round(tr.reduce((a,b)=>a+b,0) / tr.length);
-      eventos.push({ t: g.t, notas: res });
-    }
+    const ns = g.notas.filter(n => AFINACION.some(b => n.pitchMidi - b >= 0 && n.pitchMidi - b <= 22))
+      .sort((a, b) => (b.amplitude || 0) - (a.amplitude || 0)).slice(0, 6);
+    let as = null;
+    while (ns.length && !(as = asignar(ns, pos))) ns.pop();
+    if (!as) continue;
+    const res = ns.map((n, i) => ({ s: as[i].s, fr: as[i].fr, midi: n.pitchMidi, dur: n.durationSeconds }));
+    const tr = res.filter(r => r.fr > 0).map(r => r.fr);
+    if (tr.length) pos = Math.round(tr.reduce((a,b)=>a+b,0) / tr.length);
+    eventos.push({ t: g.t, notas: res });
   }
 }
 
