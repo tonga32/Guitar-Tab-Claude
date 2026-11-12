@@ -52,6 +52,13 @@ small{color:var(--mu)}
       <option value="preciso">Preciso y lento (Demucs, baja ~136 MB)</option>
       <option value="ninguno">Ninguno (el audio ya es solo guitarra)</option>
     </select></label>
+  <label>Ignorar notas más graves que
+    <select id="grave">
+      <option value="40">Mi grave (E2) — usar todas</option>
+      <option value="45">La (A2)</option>
+      <option value="50">Re (D3)</option>
+      <option value="55">Sol (G3)</option>
+    </select></label>
   <label>Sensibilidad (más a la derecha = más notas)
     <input type="range" id="sens" min="10" max="60" value="30"></label>
   <label>Largo mínimo de nota (ms)
@@ -253,10 +260,30 @@ function filtroRapido(ns) {
   return out;
 }
 
+// Quita notas graves "fantasma": graves muy débiles y la octava de abajo de una nota real
+function limpiarFantasmas(ns) {
+  const k = ns.slice().sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
+  const am = k.map(n => n.amplitude || 0).sort((a, b) => a - b);
+  const med = am.length ? am[Math.floor(am.length / 2)] : 0;
+  return k.filter((n, i) => {
+    if (n.pitchMidi < 52 && (n.amplitude || 0) < med * 0.6) return false;
+    const ini = n.startTimeSeconds, fin = ini + n.durationSeconds;
+    const choca = m => {
+      const d = m.pitchMidi - n.pitchMidi;
+      if ((d !== 12 && d !== 24) || (m.amplitude || 0) < (n.amplitude || 0) * 1.15) return false;
+      const sol = Math.min(fin, m.startTimeSeconds + m.durationSeconds) - Math.max(ini, m.startTimeSeconds);
+      return sol >= 0.5 * n.durationSeconds;
+    };
+    for (let j = i - 1; j >= 0 && k[j].startTimeSeconds >= ini - 4; j--) if (choca(k[j])) return false;
+    for (let j = i + 1; j < k.length && k[j].startTimeSeconds <= fin; j++) if (choca(k[j])) return false;
+    return true;
+  });
+}
+
 // Une los deslizamientos (slides): las notas cortas de paso se absorben en la nota anterior
 // para que el sonido no se corte, sin escribirlas como notas aparte.
-function unirDeslizados(crudas, minDur) {
-  const ns = crudas.filter(n => n.pitchMidi >= 40 && n.pitchMidi <= 88)
+function unirDeslizados(crudas, minDur, minMidi) {
+  const ns = crudas.filter(n => n.pitchMidi >= minMidi && n.pitchMidi <= 88)
     .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
   const largas = ns.filter(n => n.durationSeconds >= minDur).map(n => ({ ...n }));
   const cortas = ns.filter(n => n.durationSeconds < minDur);
@@ -314,7 +341,7 @@ $("btnTrans").onclick = async () => {
     const frame = Math.max(0.1, onset - 0.2);
     const crudas = noteFramesToTime(addPitchBendsToNoteEvents(contours,
       outputToNotesPoly(frames, onsets, onset, frame, 3, true, null, null, true, 11)));
-    let lista = unirDeslizados(crudas, $("minlen").value / 1000);
+    let lista = limpiarFantasmas(unirDeslizados(crudas, $("minlen").value / 1000, +$("grave").value));
     if (metodo === "rapido") lista = filtroRapido(lista);
     notasFinal = lista.sort((a,b) => a.startTimeSeconds - b.startTimeSeconds);
     asignarCuerdas();
