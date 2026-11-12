@@ -96,8 +96,13 @@ const $ = id => document.getElementById(id);
 let dec = null, cancelar = false, stemUrl = null;
 let eventos = [], notasFinal = [], ultimo = null, actx = null, timers = [];
 
-window.addEventListener("error", e => { $("estado").textContent = "Error: " + e.message; });
-window.addEventListener("unhandledrejection", e => { $("estado").textContent = "Error: " + (e.reason && e.reason.message || e.reason); });
+function msgError(e) {
+  if (e && e.message) return "Error: " + e.message;
+  if (typeof e === "string" && e) return "Error: " + e;
+  return "El separador se quedó sin memoria o se interrumpió. Recarga la página (F5) y vuelve a intentarlo. Si sigue pasando, usa el modo Rápido.";
+}
+window.addEventListener("error", e => { if (e.message) $("estado").textContent = "Error: " + e.message; });
+window.addEventListener("unhandledrejection", e => { $("estado").textContent = msgError(e.reason); });
 
 // ---------- Audio ----------
 async function remuestrear(buf, rate, canales) {
@@ -162,14 +167,22 @@ function wavBlob(L, R, sr) {
   for (let i = 0; i < n; i++) { v.setInt16(44 + i * 4, c(L[i]), true); v.setInt16(46 + i * 4, c(R[i]), true); }
   return new Blob([b], { type: "audio/wav" });
 }
-async function separarGuitarra() {
+let ortMod = null, sessDemucs = null;
+async function obtenerSesion() {
+  if (sessDemucs) return sessDemucs; // se reutiliza: crearla otra vez gasta mucha memoria
   $("estado").textContent = "Preparando el separador...";
-  const ort = await import(ORT + "ort.min.mjs");
-  ort.env.wasm.wasmPaths = ORT;
-  ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
-  const bytes = await bajarModelo();
+  ortMod = ortMod || await import(ORT + "ort.min.mjs");
+  ortMod.env.wasm.wasmPaths = ORT;
+  ortMod.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
+  let bytes = await bajarModelo();
   $("estado").textContent = "Cargando el modelo en memoria...";
-  const sess = await ort.InferenceSession.create(bytes, { executionProviders: ["wasm"] });
+  sessDemucs = await ortMod.InferenceSession.create(bytes, { executionProviders: ["wasm"] });
+  bytes = null;
+  return sessDemucs;
+}
+async function separarGuitarra() {
+  const sess = await obtenerSesion();
+  const ort = ortMod;
   const st = await remuestrear(dec, 44100, 2);
   const N = st.length, L = st.getChannelData(0), R = st.numberOfChannels > 1 ? st.getChannelData(1) : L;
   let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] + R[i]) / 2;
@@ -199,7 +212,6 @@ async function separarGuitarra() {
     await new Promise(r => setTimeout(r, 0));
     if (start + S >= N) break;
   }
-  try { await sess.release(); } catch (e) {}
   const mono = new Float32Array(N);
   for (let i = 0; i < N; i++) {
     const w = peso[i] || 1;
@@ -296,7 +308,8 @@ $("btnTrans").onclick = async () => {
     asignarCuerdas();
     armarPartitura();
   } catch (err) {
-    $("estado").textContent = err.message === "Cancelado" ? "Cancelado." : "Error: " + err.message;
+    if (!err || !err.message) sessDemucs = null; // la sesión pudo quedar dañada
+    $("estado").textContent = (err && err.message === "Cancelado") ? "Cancelado." : msgError(err);
   }
   $("prog").hidden = true; $("btnCancel").hidden = true; $("btnTrans").disabled = false;
 };
