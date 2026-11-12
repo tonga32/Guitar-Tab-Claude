@@ -96,7 +96,15 @@ const $ = id => document.getElementById(id);
 let dec = null, cancelar = false, stemUrl = null;
 let eventos = [], notasFinal = [], ultimo = null, actx = null, timers = [];
 
+let ortAbortado = false;
 function msgError(e) {
+  if (e && e.message && /abort|out of memory|memory/i.test(e.message)) {
+    ortAbortado = true; sessDemucs = null;
+    $("metodo").value = "rapido";
+    return "El motor de separación se detuvo, casi seguro porque al navegador se le acabó la memoria. " +
+      "Recarga la página (F5) y prueba el modo Preciso una sola vez, sin usar otras pestañas pesadas. " +
+      "Si vuelve a pasar, este equipo no tiene memoria suficiente para ese modo: usa el Rápido (ya lo dejé seleccionado).";
+  }
   if (e && e.message) return "Error: " + e.message;
   if (typeof e === "string" && e) return "Error: " + e;
   return "El separador se quedó sin memoria o se interrumpió. Recarga la página (F5) y vuelve a intentarlo. Si sigue pasando, usa el modo Rápido.";
@@ -169,6 +177,7 @@ function wavBlob(L, R, sr) {
 }
 let ortMod = null, sessDemucs = null;
 async function obtenerSesion() {
+  if (ortAbortado) throw new Error("Aborted: el motor ya se había detenido");
   if (sessDemucs) return sessDemucs; // se reutiliza: crearla otra vez gasta mucha memoria
   $("estado").textContent = "Preparando el separador...";
   ortMod = ortMod || await import(ORT + "ort.min.mjs");
@@ -176,7 +185,10 @@ async function obtenerSesion() {
   ortMod.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
   let bytes = await bajarModelo();
   $("estado").textContent = "Cargando el modelo en memoria...";
-  sessDemucs = await ortMod.InferenceSession.create(bytes, { executionProviders: ["wasm"] });
+  sessDemucs = await ortMod.InferenceSession.create(bytes, {
+    executionProviders: ["wasm"], graphOptimizationLevel: "basic",
+    enableCpuMemArena: false, enableMemPattern: false // menos memoria, algo más lento
+  });
   bytes = null;
   return sessDemucs;
 }
