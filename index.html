@@ -19,6 +19,8 @@ input[type=number]{width:110px}
 #estado{color:var(--mu);margin-top:8px}
 progress{width:100%;height:10px}
 small{color:var(--mu)}
+#zona{border:2px dashed #555;border-radius:12px;padding:22px;text-align:center;cursor:pointer;color:var(--tx)}
+#zona.sobre{border-color:var(--ac);background:#2a2418}
 /* tablatura */
 #tab{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:flex-start}
 .compas{display:flex;flex-direction:column;border-left:2px solid #888;padding-left:4px}
@@ -45,12 +47,18 @@ small{color:var(--mu)}
 <small>Todo se procesa en tu navegador. No se sube nada a ningún servidor.</small>
 
 <div class="card">
-  <input type="file" id="archivo" accept="audio/*">
+  <div id="zona">🎵 Arrastra aquí tu audio o toca para elegirlo<br><small id="nombre"></small></div>
+  <input type="file" id="archivo" accept="audio/*" hidden>
   <label>Cómo aislar la guitarra
     <select id="metodo">
       <option value="rapido">Rápido y liviano (aproximado)</option>
       <option value="preciso">Preciso y lento (Demucs, baja ~136 MB)</option>
       <option value="ninguno">Ninguno (el audio ya es solo guitarra)</option>
+    </select></label>
+  <label>Posiciones en el mástil
+    <select id="guitarra">
+      <option value="electrica">Libre (hasta el traste 22)</option>
+      <option value="acustica">Guitarra acústica (prioriza hasta el traste 12)</option>
     </select></label>
   <label>Ignorar notas más graves que
     <select id="grave">
@@ -96,6 +104,7 @@ import { BasicPitch, noteFramesToTime, addPitchBendsToNoteEvents, outputToNotesP
 
 const MODEL = "https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/model/model.json";
 const MODELO = "https://huggingface.co/StemSplitio/htdemucs-6s-onnx/resolve/main/htdemucs_6s_fp16weights.onnx";
+const MODELO_GPU = "https://huggingface.co/kramp/htdemucs-6s-webgpu-onnx/resolve/main/htdemucs_6s.onnx";
 const ORT = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
 const AFINACION = [40,45,50,55,59,64]; // E2 A2 D3 G3 B3 E4 (índice 0 = cuerda más grave)
 const NOMBRES = ["e","B","G","D","A","E"];
@@ -133,28 +142,40 @@ async function filtrarAudio(buf) { // quita graves (bajo) y agudos (platillos)
   src.connect(hp); hp.connect(lp); lp.connect(off.destination); src.start();
   return off.startRendering();
 }
-$("archivo").onchange = async e => {
-  const f = e.target.files[0]; if (!f) return;
+async function cargarArchivo(f) {
+  if (!f) return;
+  $("nombre").textContent = f.name;
   $("estado").textContent = "Leyendo audio...";
+  $("btnTrans").disabled = true;
   try {
     const ac = new (window.AudioContext || window.webkitAudioContext)();
     dec = await ac.decodeAudioData(await f.arrayBuffer());
     ac.close();
     $("estado").textContent = "Listo (" + dec.duration.toFixed(1) + " s). Pulsa Transcribir.";
     $("btnTrans").disabled = false;
-  } catch (err) { $("estado").textContent = "No pude leer ese archivo: " + err.message; }
-};
+  } catch (err) { dec = null; $("estado").textContent = "No pude leer ese archivo como audio. Prueba con mp3, wav, m4a u ogg."; }
+}
+$("zona").onclick = () => $("archivo").click();
+$("archivo").onchange = e => cargarArchivo(e.target.files[0]);
+["dragenter", "dragover"].forEach(ev => document.addEventListener(ev, e => {
+  e.preventDefault(); $("zona").classList.add("sobre");
+}));
+document.addEventListener("dragleave", e => { if (!e.relatedTarget) $("zona").classList.remove("sobre"); });
+document.addEventListener("drop", e => {
+  e.preventDefault(); $("zona").classList.remove("sobre");
+  cargarArchivo(e.dataTransfer && e.dataTransfer.files[0]);
+});
 $("btnCancel").onclick = () => { cancelar = true; };
 
 // ---------- Separación precisa (Demucs 6 stems) ----------
-async function bajarModelo() {
+async function bajarModelo(url) {
   let cache = null;
   try {
     cache = await caches.open("demucs-modelo");
-    const hit = await cache.match(MODELO);
+    const hit = await cache.match(url);
     if (hit) return new Uint8Array(await hit.arrayBuffer());
   } catch (e) {}
-  const r = await fetch(MODELO);
+  const r = await fetch(url);
   if (!r.ok) throw new Error("No pude bajar el modelo (" + r.status + ")");
   const total = +r.headers.get("content-length") || 0;
   const rd = r.body.getReader(), partes = []; let got = 0;
@@ -168,7 +189,7 @@ async function bajarModelo() {
   }
   const bytes = new Uint8Array(got); let o = 0;
   for (const p of partes) { bytes.set(p, o); o += p.length; }
-  try { if (cache) await cache.put(MODELO, new Response(bytes.slice())); } catch (e) {}
+  try { if (cache) await cache.put(url, new Response(bytes.slice())); } catch (e) {}
   return bytes;
 }
 function wavBlob(L, R, sr) {
@@ -182,24 +203,44 @@ function wavBlob(L, R, sr) {
   for (let i = 0; i < n; i++) { v.setInt16(44 + i * 4, c(L[i]), true); v.setInt16(46 + i * 4, c(R[i]), true); }
   return new Blob([b], { type: "audio/wav" });
 }
-let ortMod = null, sessDemucs = null;
+let ortMod = null, sessDemucs = null, usandoGpu = false, gpuFallo = false, ortGpuMod = null, ortCpuMod = null;
+async function crearSesion(gpu) {
+  const mod = gpu ? (ortGpuMod = ortGpuMod || await import(ORT + "ort.webgpu.min.mjs"))
+                  : (ortCpuMod = ortCpuMod || await import(ORT + "ort.min.mjs"));
+  mod.env.wasm.wasmPaths = ORT;
+  mod.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
+  let bytes = await bajarModelo(gpu ? MODELO_GPU : MODELO);
+  $("estado").textContent = "Cargando el modelo en memoria...";
+  const opc = gpu ? { executionProviders: ["webgpu"] } : {
+    executionProviders: ["wasm"], graphOptimizationLevel: "basic",
+    enableCpuMemArena: false, enableMemPattern: false // menos memoria, algo más lento
+  };
+  const sess = await mod.InferenceSession.create(bytes, opc);
+  bytes = null; ortMod = mod; usandoGpu = gpu;
+  return sess;
+}
 async function obtenerSesion() {
   if (ortAbortado) throw new Error("Aborted: el motor ya se había detenido");
   if (sessDemucs) return sessDemucs; // se reutiliza: crearla otra vez gasta mucha memoria
   $("estado").textContent = "Preparando el separador...";
-  ortMod = ortMod || await import(ORT + "ort.min.mjs");
-  ortMod.env.wasm.wasmPaths = ORT;
-  ortMod.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
-  let bytes = await bajarModelo();
-  $("estado").textContent = "Cargando el modelo en memoria...";
-  sessDemucs = await ortMod.InferenceSession.create(bytes, {
-    executionProviders: ["wasm"], graphOptimizationLevel: "basic",
-    enableCpuMemArena: false, enableMemPattern: false // menos memoria, algo más lento
-  });
-  bytes = null;
+  if (navigator.gpu && !gpuFallo) {
+    try { sessDemucs = await crearSesion(true); return sessDemucs; }
+    catch (e) { gpuFallo = true; sessDemucs = null; }
+  }
+  sessDemucs = await crearSesion(false);
   return sessDemucs;
 }
 async function separarGuitarra() {
+  try { return await separarCon(); }
+  catch (e) {
+    if (e && e.message === "GPU_FALLO") {
+      $("estado").textContent = "La tarjeta gráfica no pudo con el modelo; probando con el procesador (más lento)...";
+      return await separarCon();
+    }
+    throw e;
+  }
+}
+async function separarCon() {
   const sess = await obtenerSesion();
   const ort = ortMod;
   const st = await remuestrear(dec, 44100, 2);
@@ -218,7 +259,12 @@ async function separarGuitarra() {
     if (cancelar) throw new Error("Cancelado");
     const len = Math.min(S, N - start), inp = new Float32Array(2 * S);
     for (let i = 0; i < len; i++) { inp[i] = (L[start + i] - mean) / std; inp[S + i] = (R[start + i] - mean) / std; }
-    const res = await sess.run({ mix: new ort.Tensor("float32", inp, [1, 2, S]) });
+    let res;
+    try { res = await sess.run({ mix: new ort.Tensor("float32", inp, [1, 2, S]) }); }
+    catch (e) {
+      if (usandoGpu) { usandoGpu = false; gpuFallo = true; sessDemucs = null; throw new Error("GPU_FALLO"); }
+      throw e;
+    }
     const d = res.stems.data, oL = 8 * S, oR = 9 * S; // stem 4 = guitarra
     for (let i = 0; i < len; i++) {
       const w = win[i];
@@ -226,7 +272,7 @@ async function separarGuitarra() {
     }
     k++; $("prog").value = k / total;
     const resta = (performance.now() - t0) / k * (total - k) / 60000;
-    $("estado").textContent = "Separando la guitarra: bloque " + k + " de " + total +
+    $("estado").textContent = "Separando la guitarra" + (usandoGpu ? " (con la tarjeta gráfica)" : "") + ": bloque " + k + " de " + total +
       (k > 1 ? " — faltan unos " + Math.max(1, Math.round(resta)) + " min" : "");
     await new Promise(r => setTimeout(r, 0));
     if (start + S >= N) break;
@@ -353,52 +399,75 @@ $("btnTrans").onclick = async () => {
   $("prog").hidden = true; $("btnCancel").hidden = true; $("btnTrans").disabled = false;
 };
 
-// ---------- Cuerda y traste ----------
-function asignar(ns, pos) {
-  const cand = ns.map(n => {
+// ---------- Cuerda y traste (mejor camino por todo el tema) ----------
+function costoTraste(fr, ac) {
+  let c = fr * 0.05 + (fr === 0 ? -0.5 : 0);
+  if (fr > 12) c += ac ? 6 + (fr - 12) * 4 : (fr - 12) * 0.5; // acústica: evita pasar del 12 salvo que no haya otra
+  return c;
+}
+function candidatos(ns, ac, K) {
+  const opc = ns.map(n => {
     const c = [];
-    for (let s = 0; s < 6; s++) { const fr = n.pitchMidi - AFINACION[s]; if (fr >= 0 && fr <= 22) c.push({ s, fr }); }
+    for (let st = 0; st < 6; st++) { const fr = n.pitchMidi - AFINACION[st]; if (fr >= 0 && fr <= 22) c.push({ s: st, fr }); }
     return c;
   });
-  let best = null, bestC = 1e9; const cur = [];
+  const res = [], cur = [];
   (function rec(i, usadas, costo) {
-    if (costo >= bestC) return;
     if (i === ns.length) {
       const fr = cur.filter(x => x.fr > 0).map(x => x.fr);
       const span = fr.length ? Math.max(...fr) - Math.min(...fr) : 0;
-      const tot = costo + span * 0.5 + (span > 4 ? (span - 4) * 3 : 0);
-      if (tot < bestC) { bestC = tot; best = cur.slice(); }
+      const tot = costo + (span > 5 ? 50 + span * 5 : span * 0.5 + (span > 3 ? (span - 3) * 2 : 0));
+      res.push({ costo: tot, as: cur.slice(), pos: fr.length ? fr.reduce((a, b) => a + b, 0) / fr.length : null });
       return;
     }
-    for (const c of cand[i]) {
+    for (const c of opc[i]) {
       if (usadas & (1 << c.s)) continue;
-      cur[i] = c;
-      rec(i + 1, usadas | (1 << c.s), costo + Math.abs(c.fr - pos) + (c.fr > 12 ? 2 : 0) + (c.fr === 0 ? -1 : 0));
+      cur[i] = c; rec(i + 1, usadas | (1 << c.s), costo + costoTraste(c.fr, ac));
     }
   })(0, 0, 0);
-  return best;
+  res.sort((a, b) => a.costo - b.costo);
+  return res.slice(0, K);
 }
 
 function asignarCuerdas() {
+  const ac = $("guitarra").value === "acustica";
   const grupos = [];
   for (const n of notasFinal) {
     const g = grupos[grupos.length-1];
     if (g && n.startTimeSeconds - g.t < 0.07) g.notas.push(n);
     else grupos.push({ t: n.startTimeSeconds, notas: [n] });
   }
-  let pos = 5; eventos = [];
+  const evs = [];
   for (const g of grupos) {
     const ns = g.notas.filter(n => AFINACION.some(b => n.pitchMidi - b >= 0 && n.pitchMidi - b <= 22))
       .sort((a, b) => (b.amplitude || 0) - (a.amplitude || 0)).slice(0, 6);
-    let as = null;
-    while (ns.length && !(as = asignar(ns, pos))) ns.pop();
-    if (!as) continue;
-    const res = ns.map((n, i) => ({ s: as[i].s, fr: as[i].fr, midi: n.pitchMidi, dur: n.durationSeconds }));
-    const tr = res.filter(r => r.fr > 0).map(r => r.fr);
-    if (tr.length) pos = Math.round(tr.reduce((a,b)=>a+b,0) / tr.length);
-    eventos.push({ t: g.t, notas: res });
+    let cands = [];
+    while (ns.length && !(cands = candidatos(ns, ac, 8)).length) ns.pop();
+    if (cands.length) evs.push({ t: g.t, ns, cands });
   }
+  // Viterbi: elegir las digitaciones que menos obligan a mover la mano
+  evs.forEach((ev, i) => {
+    ev.cands.forEach(c => {
+      if (i === 0) { c.tot = c.costo; c.ant = null; c.eff = c.pos != null ? c.pos : 5; return; }
+      const w = ev.t - evs[i-1].t > 1 ? 0.3 : 1;
+      let mejor = Infinity, bp = null;
+      for (const p of evs[i-1].cands) {
+        const t = p.tot + (c.pos != null ? Math.abs(c.pos - p.eff) * w : 0);
+        if (t < mejor) { mejor = t; bp = p; }
+      }
+      c.tot = mejor + c.costo; c.ant = bp; c.eff = c.pos != null ? c.pos : bp.eff;
+    });
+  });
+  eventos = [];
+  if (!evs.length) return;
+  let c = evs[evs.length-1].cands.reduce((a, b) => (b.tot < a.tot ? b : a));
+  for (let i = evs.length - 1; i >= 0; i--) { evs[i].elegido = c; c = c.ant; }
+  eventos = evs.map(ev => ({
+    t: ev.t,
+    notas: ev.ns.map((n, k) => ({ s: ev.elegido.as[k].s, fr: ev.elegido.as[k].fr, midi: n.pitchMidi, dur: n.durationSeconds }))
+  }));
 }
+$("guitarra").onchange = () => { if (notasFinal.length) { asignarCuerdas(); armarPartitura(); } };
 
 // ---------- Tempo, compases y duraciones ----------
 function detectarBpm() {
