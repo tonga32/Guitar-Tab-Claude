@@ -51,8 +51,8 @@ small{color:var(--mu)}
   <input type="file" id="archivo" accept="audio/*" hidden>
   <label>Cómo aislar la guitarra
     <select id="metodo">
-      <option value="rapido">Rápido y liviano (aproximado)</option>
-      <option value="preciso">Preciso y lento (Demucs, baja ~136 MB)</option>
+      <option value="umx">Liviano (Open-Unmix, baja ~36 MB)</option>
+      <option value="preciso">Preciso y lento (solo equipos potentes, 8 GB de RAM o más)</option>
       <option value="ninguno">Ninguno (el audio ya es solo guitarra)</option>
     </select></label>
   <label>Posiciones en el mástil
@@ -104,6 +104,7 @@ import { BasicPitch, noteFramesToTime, addPitchBendsToNoteEvents, outputToNotesP
 
 const MODEL = "https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/model/model.json";
 const MODELO = "https://huggingface.co/StemSplitio/htdemucs-6s-onnx/resolve/main/htdemucs_6s_fp16weights.onnx";
+const MODELO_UMX = "https://huggingface.co/MixDirective/open-unmix-umxhq-other-onnx/resolve/main/model.onnx";
 const MODELO_GPU = "https://huggingface.co/kramp/htdemucs-6s-webgpu-onnx/resolve/main/htdemucs_6s.onnx";
 const ORT = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
 const AFINACION = [40,45,50,55,59,64]; // E2 A2 D3 G3 B3 E4 (índice 0 = cuerda más grave)
@@ -116,14 +117,14 @@ let ortAbortado = false;
 function msgError(e) {
   if (e && e.message && /abort|out of memory|memory/i.test(e.message)) {
     ortAbortado = true; sessDemucs = null;
-    $("metodo").value = "rapido";
+    $("metodo").value = "umx";
     return "El motor de separación se detuvo, casi seguro porque al navegador se le acabó la memoria. " +
       "Recarga la página (F5) y prueba el modo Preciso una sola vez, sin usar otras pestañas pesadas. " +
-      "Si vuelve a pasar, este equipo no tiene memoria suficiente para ese modo: usa el Rápido (ya lo dejé seleccionado).";
+      "Si vuelve a pasar, este equipo no tiene memoria suficiente para ese modo: usa el modo Liviano (ya lo dejé seleccionado).";
   }
   if (e && e.message) return "Error: " + e.message;
   if (typeof e === "string" && e) return "Error: " + e;
-  return "El separador se quedó sin memoria o se interrumpió. Recarga la página (F5) y vuelve a intentarlo. Si sigue pasando, usa el modo Rápido.";
+  return "El separador se quedó sin memoria o se interrumpió. Recarga la página (F5) y vuelve a intentarlo. Si sigue pasando, usa el modo Liviano.";
 }
 window.addEventListener("error", e => { if (e.message) $("estado").textContent = "Error: " + e.message; });
 window.addEventListener("unhandledrejection", e => { $("estado").textContent = msgError(e.reason); });
@@ -203,6 +204,7 @@ function wavBlob(L, R, sr) {
   for (let i = 0; i < n; i++) { v.setInt16(44 + i * 4, c(L[i]), true); v.setInt16(46 + i * 4, c(R[i]), true); }
   return new Blob([b], { type: "audio/wav" });
 }
+const USAR_GPU = false; // desactivado: en equipos con gráfica integrada puede trabar todo
 let ortMod = null, sessDemucs = null, usandoGpu = false, gpuFallo = false, ortGpuMod = null, ortCpuMod = null;
 async function crearSesion(gpu) {
   const mod = gpu ? (ortGpuMod = ortGpuMod || await import(ORT + "ort.webgpu.min.mjs"))
@@ -223,7 +225,7 @@ async function obtenerSesion() {
   if (ortAbortado) throw new Error("Aborted: el motor ya se había detenido");
   if (sessDemucs) return sessDemucs; // se reutiliza: crearla otra vez gasta mucha memoria
   $("estado").textContent = "Preparando el separador...";
-  if (navigator.gpu && !gpuFallo) {
+  if (USAR_GPU && navigator.gpu && !gpuFallo) {
     try { sessDemucs = await crearSesion(true); return sessDemucs; }
     catch (e) { gpuFallo = true; sessDemucs = null; }
   }
@@ -291,7 +293,115 @@ async function separarCon() {
   return remuestrear(ab, 22050, 1);
 }
 
-// ---------- Selección rápida de notas de guitarra ----------
+// ---------- Separación liviana: Open-Unmix ----------
+const NF = 4096, HOP = 1024, NB = 2049;
+const VENT = new Float64Array(NF);
+for (let i = 0; i < NF; i++) VENT[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / NF);
+function crearFFT(n) {
+  const cs = new Float64Array(n / 2), sn = new Float64Array(n / 2), rev = new Uint16Array(n), bits = Math.log2(n);
+  for (let i = 0; i < n / 2; i++) { cs[i] = Math.cos(2 * Math.PI * i / n); sn[i] = Math.sin(2 * Math.PI * i / n); }
+  for (let i = 0; i < n; i++) { let r = 0; for (let b = 0; b < bits; b++) if (i & (1 << b)) r |= 1 << (bits - 1 - b); rev[i] = r; }
+  return function (re, im, inv) {
+    for (let i = 0; i < n; i++) { const j = rev[i]; if (j > i) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; } }
+    for (let size = 2; size <= n; size <<= 1) {
+      const half = size >> 1, step = n / size;
+      for (let i = 0; i < n; i += size) for (let j = 0, k = 0; j < half; j++, k += step) {
+        const wr = cs[k], wi = inv ? sn[k] : -sn[k], a = i + j, b = a + half;
+        const tr = re[b] * wr - im[b] * wi, ti = re[b] * wi + im[b] * wr;
+        re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti;
+      }
+    }
+    if (inv) for (let i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
+  };
+}
+const FFT = crearFFT(NF), zr = new Float64Array(NF), zi = new Float64Array(NF);
+
+// Espectrograma de un tramo estéreo. Disposición: [canal][bin][cuadro]
+function stftTramo(xL, xR, M) {
+  const F = 1 + Math.floor(M / HOP), H = NF / 2;
+  const mag = new Float32Array(2 * NB * F), re = new Float32Array(2 * NB * F), im = new Float32Array(2 * NB * F);
+  const g = (x, j) => { if (j < 0) j = -j; if (j >= M) j = 2 * (M - 1) - j; return (j < 0 || j >= M) ? 0 : x[j]; };
+  for (let f = 0; f < F; f++) {
+    const base = f * HOP - H;
+    for (let i = 0; i < NF; i++) { zr[i] = g(xL, base + i) * VENT[i]; zi[i] = g(xR, base + i) * VENT[i]; }
+    FFT(zr, zi, false); // los dos canales a la vez (L real + R imaginario)
+    for (let k = 0; k < NB; k++) {
+      const k2 = (NF - k) & (NF - 1), ar = zr[k], ai = zi[k], br = zr[k2], bi = -zi[k2];
+      const lr = (ar + br) / 2, li = (ai + bi) / 2, rr = (ai - bi) / 2, ri = -(ar - br) / 2;
+      const a = k * F + f, b = (NB + k) * F + f;
+      re[a] = lr; im[a] = li; mag[a] = Math.hypot(lr, li);
+      re[b] = rr; im[b] = ri; mag[b] = Math.hypot(rr, ri);
+    }
+  }
+  return { F, mag, re, im };
+}
+function istftTramo(re, im, F, M) {
+  const H = NF / 2, Lg = M + NF;
+  const accL = new Float32Array(Lg), accR = new Float32Array(Lg), ws = new Float32Array(Lg);
+  for (let f = 0; f < F; f++) {
+    for (let k = 0; k < NB; k++) {
+      const lr = re[k * F + f], li = im[k * F + f], rr = re[(NB + k) * F + f], ri = im[(NB + k) * F + f];
+      zr[k] = lr - ri; zi[k] = li + rr;
+      if (k > 0 && k < NB - 1) { zr[NF - k] = lr + ri; zi[NF - k] = rr - li; }
+    }
+    FFT(zr, zi, true);
+    const s0 = f * HOP;
+    for (let i = 0; i < NF; i++) { const w = VENT[i]; accL[s0 + i] += zr[i] * w; accR[s0 + i] += zi[i] * w; ws[s0 + i] += w * w; }
+  }
+  const yL = new Float32Array(M), yR = new Float32Array(M);
+  for (let j = 0; j < M; j++) { const w = ws[j + H]; if (w > 1e-8) { yL[j] = accL[j + H] / w; yR[j] = accR[j + H] / w; } }
+  return { L: yL, R: yR };
+}
+
+let sessUmx = null;
+async function obtenerUmx() {
+  if (ortAbortado) throw new Error("Aborted: el motor ya se había detenido");
+  if (sessUmx) return sessUmx;
+  $("estado").textContent = "Preparando Open-Unmix...";
+  ortCpuMod = ortCpuMod || await import(ORT + "ort.min.mjs");
+  ortCpuMod.env.wasm.wasmPaths = ORT;
+  ortCpuMod.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
+  const bytes = await bajarModelo(MODELO_UMX);
+  $("estado").textContent = "Cargando el modelo en memoria...";
+  sessUmx = await ortCpuMod.InferenceSession.create(bytes, { executionProviders: ["wasm"] });
+  return sessUmx;
+}
+
+async function separarUmx() {
+  const sess = await obtenerUmx(), ort = ortCpuMod;
+  const st = await remuestrear(dec, 44100, 2);
+  const N = st.length, L = st.getChannelData(0), R = st.numberOfChannels > 1 ? st.getChannelData(1) : L;
+  const outL = new Float32Array(N), outR = new Float32Array(N);
+  const CORE = 15 * 44100, CTX = 3 * 44100, total = Math.ceil(N / CORE), t0 = performance.now();
+  for (let k = 0, a = 0; a < N; k++, a += CORE) {
+    if (cancelar) throw new Error("Cancelado");
+    const b = Math.min(N, a + CORE), s0 = Math.max(0, a - CTX), s1 = Math.min(N, b + CTX), M = s1 - s0;
+    const T = stftTramo(L.subarray(s0, s1), R.subarray(s0, s1), M);
+    const res = await sess.run({ [sess.inputNames[0]]: new ort.Tensor("float32", T.mag, [1, 2, NB, T.F]) });
+    const o = (res.other_magnitude || res[sess.outputNames[0]]).data;
+    for (let i = 0; i < o.length; i++) {
+      let m = o[i] / (T.mag[i] + 1e-8); m = m < 0 ? 0 : (m > 1 ? 1 : m);
+      T.re[i] *= m; T.im[i] *= m;
+    }
+    const Y = istftTramo(T.re, T.im, T.F, M), off = a - s0;
+    for (let i = 0; i < b - a; i++) { outL[a + i] = Y.L[off + i]; outR[a + i] = Y.R[off + i]; }
+    $("prog").value = (k + 1) / total;
+    const resta = (performance.now() - t0) / (k + 1) * (total - k - 1) / 60000;
+    $("estado").textContent = "Separando con Open-Unmix: tramo " + (k + 1) + " de " + total +
+      (k > 0 ? " — faltan unos " + Math.max(1, Math.round(resta)) + " min" : "");
+    await new Promise(r => setTimeout(r, 0));
+  }
+  const mono = new Float32Array(N);
+  for (let i = 0; i < N; i++) mono[i] = (outL[i] + outR[i]) / 2;
+  if (stemUrl) URL.revokeObjectURL(stemUrl);
+  stemUrl = URL.createObjectURL(wavBlob(outL, outR, 44100));
+  $("stem").src = stemUrl; $("stem").hidden = false;
+  const ab = new AudioBuffer({ length: N, sampleRate: 44100, numberOfChannels: 1 });
+  ab.copyToChannel(mono, 0);
+  return remuestrear(ab, 22050, 1);
+}
+
+// ---------- Selección de notas de guitarra ----------
 function filtroRapido(ns) {
   if (ns.length < 8) return ns;
   const a = ns.map(n => n.amplitude).sort((x, y) => x - y);
@@ -369,12 +479,15 @@ $("btnTrans").onclick = async () => {
   $("prog").hidden = false; $("prog").value = 0; $("stem").hidden = true;
   try {
     const metodo = $("metodo").value;
+    if (metodo === "preciso" && !confirm("El modo Preciso usa muchísima memoria y puede trabar la computadora si es modesta " +
+      "(necesita unos 8 GB de RAM libres y puede tardar muchos minutos). ¿Quieres continuar de todos modos?"))
+      throw new Error("Cancelado");
     let mono;
     if (metodo === "preciso") mono = await separarGuitarra();
+    else if (metodo === "umx") mono = await separarUmx();
     else {
       $("estado").textContent = "Preparando el audio...";
       mono = await remuestrear(dec, 22050, 1);
-      if (metodo === "rapido") mono = await filtrarAudio(mono);
     }
     $("prog").value = 0;
     $("estado").textContent = "Detectando notas (la primera vez baja el modelo de notas)...";
@@ -388,7 +501,7 @@ $("btnTrans").onclick = async () => {
     const crudas = noteFramesToTime(addPitchBendsToNoteEvents(contours,
       outputToNotesPoly(frames, onsets, onset, frame, 3, true, null, null, true, 11)));
     let lista = limpiarFantasmas(unirDeslizados(crudas, $("minlen").value / 1000, +$("grave").value));
-    if (metodo === "rapido") lista = filtroRapido(lista);
+    if (metodo === "umx") lista = filtroRapido(lista);
     notasFinal = lista.sort((a,b) => a.startTimeSeconds - b.startTimeSeconds);
     asignarCuerdas();
     armarPartitura();
